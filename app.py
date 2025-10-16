@@ -130,6 +130,6 @@ st.pydeck_chart(deck, use_container_width=True, height=650)
 
 # leyenda
 if len(qs) >= 2:
-    st.markdown("__Clases (cuantiles)__: " + ", ".join([f"{qs[i]:.0f}–{qs[i+1]:.0f}" for i in range(len(qs)-1)])
+    st.markdown("__Clases (cuantiles)__: " + ", ".join([f"{qs[i]:.0f}–{qs[i+1]:.0f}" for i in range(len(qs)-1)]))
 
 
