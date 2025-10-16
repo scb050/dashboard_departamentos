@@ -1,57 +1,115 @@
-# app.py — Mapa interactivo simple con PyDeck (sin Folium)
+# app.py — Mapa interactivo (PyDeck) SIN pandas/folium
 
+import csv
 import json
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
 import streamlit as st
 import pydeck as pdk
+from math import isnan
 
 st.set_page_config(page_title="Mapa por Departamentos", layout="wide")
 st.title("Dashboard Geográfico — Departamentos")
 
-# Rutas
 BASE = Path(__file__).parent
 DATA = BASE / "data"
 GEOJSON_PATH = DATA / "departamentos.geojson"
 CSV_PATH = DATA / "atributos.csv"
 
-@st.cache_data
-def load_data():
-    with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
-        gj = json.load(f)
-    df = pd.read_csv(CSV_PATH)
-    return gj, df
+# -------- utilidades --------
+def read_csv_dicts(path: Path):
+    rows = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    return rows
 
-gj, df = load_data()
+def to_float_or_none(x):
+    try:
+        v = float(str(x).replace(",", "."))
+        #  evitar inf/nan
+        if v != v:  # NaN
+            return None
+        return v
+    except Exception:
+        return None
 
-# Fijar claves
+def quantiles(values, k=5):
+    """k clases (k=5 → 6 cortes). Sin numpy."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return [0, 1]
+    qs = []
+    for i in range(k+1):
+        pos = i * (len(vals)-1) / k
+        lo, hi = int(pos), min(int(pos)+1, len(vals)-1)
+        w = pos - lo
+        qs.append(vals[lo] * (1-w) + vals[hi] * w)
+    return qs
+
+def approximate_center(geojson):
+    xmin = ymin = float("inf")
+    xmax = ymax = float("-inf")
+
+    def it(geom):
+        if not geom: return
+        t = geom.get("type")
+        if t == "Polygon":
+            for ring in geom["coordinates"]:
+                for x, y in ring: yield x, y
+        elif t == "MultiPolygon":
+            for poly in geom["coordinates"]:
+                for ring in poly:
+                    for x, y in ring: yield x, y
+
+    for feat in geojson.get("features", []):
+        for x, y in it(feat.get("geometry")):
+            xmin = min(xmin, x); ymin = min(ymin, y)
+            xmax = max(xmax, x); ymax = max(ymax, y)
+
+    if xmin == float("inf"):
+        return 4.6, -74.3, 4.5
+    lat = (ymin + ymax) / 2.0
+    lon = (xmin + xmax) / 2.0
+    span = max(xmax - xmin, ymax - ymin)
+    zoom = 4.5 if span > 15 else 5.0
+    return lat, lon, zoom
+
+# -------- carga de datos --------
+with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
+    gj = json.load(f)
+
+rows = read_csv_dicts(CSV_PATH)
+
+# claves/columnas
 GEO_KEY = "DPTO_CCDGO"
-DF_KEY = "DPTO_CCDGO" if "DPTO_CCDGO" in df.columns else df.columns[0]
+csv_cols = list(rows[0].keys()) if rows else []
+DF_KEY = GEO_KEY if GEO_KEY in csv_cols else (csv_cols[0] if csv_cols else GEO_KEY)
 
-# --- Sidebar ---
+# detectar columnas numéricas
+num_cols = []
+for c in csv_cols:
+    if c == DF_KEY: 
+        continue
+    any_float = any(to_float_or_none(r.get(c)) is not None for r in rows[:50])
+    if any_float:
+        num_cols.append(c)
+if not num_cols:
+    num_cols = [c for c in csv_cols if c != DF_KEY] or [DF_KEY]
+
+default_idx = num_cols.index("DIRECTORIO") if "DIRECTORIO" in num_cols else 0
+
 st.sidebar.header("Configuración del mapa")
+metric = st.sidebar.selectbox("Variable numérica para coropletas", num_cols, index=default_idx)
 
-# Columnas numéricas (excluye la clave)
-numeric_cols = [c for c in df.select_dtypes(include="number").columns if c != DF_KEY]
-if not numeric_cols:
-    df["valor_demo"] = range(len(df))
-    numeric_cols = ["valor_demo"]
+# mapa de valores por código
+values_map = {}
+for r in rows:
+    key = str(r.get(DF_KEY, "")).strip()
+    val = to_float_or_none(r.get(metric))
+    if key:
+        values_map[key] = val
 
-# Si existe DIRECTORIO, úsala por defecto
-default_idx = numeric_cols.index("DIRECTORIO") if "DIRECTORIO" in numeric_cols else 0
-metric = st.sidebar.selectbox("Variable numérica para coropletas", numeric_cols, index=default_idx)
-
-# --- Join: df -> geojson properties ---
-df2 = df[[DF_KEY, metric]].copy()
-df2[DF_KEY] = df2[DF_KEY].astype(str)
-df2[metric] = pd.to_numeric(df2[metric], errors="coerce")
-df2 = df2.dropna(subset=[metric])
-
-values_map = dict(zip(df2[DF_KEY], df2[metric]))
-
-# paleta de 5 clases (azules)
+# paleta
 palette = [
     [239, 243, 255],
     [189, 215, 231],
@@ -59,95 +117,55 @@ palette = [
     [49, 130, 189],
     [8, 81, 156],
 ]
+qs = quantiles([v for v in values_map.values() if v is not None], k=5)
+if len(qs) < 2:
+    qs = [0, 1]
 
-vals = np.array(list(values_map.values())) if values_map else np.array([0, 1])
-q = np.quantile(vals, [0, 0.2, 0.4, 0.6, 0.8, 1.0]).tolist()
-
-def color_for_value(v: float):
-    if v is None or not np.isfinite(v):
+def color_for_value(v):
+    if v is None:
         return [230, 230, 230, 160]
-    # asignar clase según cuantiles
     for i in range(5):
-        if q[i] <= v <= q[i+1]:
-            return palette[i] + [180]  # RGBA
+        if qs[i] <= v <= qs[i+1]:
+            return palette[i] + [180]
     return palette[-1] + [180]
 
-# Meter valor y color dentro de cada feature
+# inyectar propiedades para tooltip/color
 for feat in gj.get("features", []):
     props = feat.setdefault("properties", {})
-    key = str(props.get(GEO_KEY, ""))
-    val = values_map.get(key, None)
-    props["_value"] = None if val is None else float(val)
+    key = str(props.get(GEO_KEY, "")).strip()
+    val = values_map.get(key)
+    props["_value"] = val if val is not None else None
     props["_color"] = color_for_value(val)
-    # tooltip seguro
-    props["_label"] = f"{GEO_KEY}: {key}<br>{metric}: {props['_value'] if props['_value'] is not None else 'N/A'}"
-
-# Calcular centro aproximado para la vista
-def approximate_center(feature_collection):
-    xmin = ymin = float("inf")
-    xmax = ymax = float("-inf")
-
-    def iter_coords(geom):
-        if not geom: 
-            return
-        t = geom.get("type")
-        if t == "Polygon":
-            for ring in geom["coordinates"]:
-                for x, y in ring:
-                    yield x, y
-        elif t == "MultiPolygon":
-            for poly in geom["coordinates"]:
-                for ring in poly:
-                    for x, y in ring:
-                        yield x, y
-
-    for f in feature_collection.get("features", []):
-        for x, y in iter_coords(f.get("geometry")):
-            xmin = min(xmin, x); ymin = min(ymin, y)
-            xmax = max(xmax, x); ymax = max(ymax, y)
-
-    if xmin == float("inf"):
-        # Colombia aprox
-        return 4.6, -74.3, 4.5
-    lat = (ymin + ymax) / 2.0
-    lon = (xmin + xmax) / 2.0
-    # zoom heurístico
-    span = max(xmax - xmin, ymax - ymin)
-    zoom = 4.5 if span > 15 else 5.0
-    return lat, lon, zoom
+    props["_label"] = f"{GEO_KEY}: {key}<br>{metric}: {val if val is not None else 'N/A'}"
 
 lat, lon, zoom = approximate_center(gj)
 
-# Capa GeoJSON
 layer = pdk.Layer(
     "GeoJsonLayer",
-    data=gj,  # dict, no ruta
+    data=gj,
     stroked=True,
     filled=True,
     get_fill_color="properties._color",
-    get_line_color=[80, 80, 80],
+    get_line_color=[80,80,80],
     get_line_width=1,
     pickable=True,
     auto_highlight=True,
 )
 
-# Tooltip
-tooltip = {
-    "html": "{properties._label}",
-    "style": {"backgroundColor": "rgba(50, 50, 50, 0.8)", "color": "white"}
-}
+deck = pdk.Deck(
+    layers=[layer],
+    initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=zoom),
+    tooltip={"html": "{properties._label}", "style": {"backgroundColor": "rgba(50,50,50,0.85)", "color":"white"}},
+    map_provider=None,   # sin token
+)
 
-# Vista y render
-view = pdk.ViewState(latitude=lat, longitude=lon, zoom=zoom)
-deck = pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip, map_provider=None)  # sin basemap (evita token)
 st.pydeck_chart(deck, use_container_width=True)
 
-# Leyenda mínima
-st.markdown(f"**Variable:** `{metric}` &nbsp;&nbsp; | &nbsp;&nbsp; Clases por cuantiles: {', '.join([f'{q[i]:.0f}-{q[i+1]:.0f}' for i in range(5)])}")
-
-
-
-
-
-
+# leyenda simple
+if len(qs) >= 2:
+    st.markdown(
+        "**Clases (cuantiles):** " + 
+        ", ".join([f"{qs[i]:.0f}–{qs[i+1]:.0f}" for i in range(len(qs)-1)])
+        + f" &nbsp;&nbsp;|&nbsp;&nbsp; **Variable:** `{metric}`"
+    )
 
